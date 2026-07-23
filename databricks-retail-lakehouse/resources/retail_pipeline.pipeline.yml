@@ -1,0 +1,23 @@
+resources:
+  pipelines:
+    retail_lakehouse_pipeline:
+      name: ${bundle.target}-retail-lakehouse-pipeline
+      catalog: ${var.catalog}
+      target: ${var.schema}
+      serverless: true
+      development: true
+      continuous: false
+      channel: CURRENT
+      photon: true
+      libraries:
+        - file:
+            path: ../src/pipeline/01_bronze.py
+        - file:
+            path: ../src/pipeline/02_silver.py
+        - file:
+            path: ../src/pipeline/03_gold.py
+      configuration:
+        retail.source_path: /Volumes/${var.catalog}/${var.source_schema}/${var.volume}
+      permissions:
+        - level: CAN_VIEW
+          group_name: users

@@ -1,0 +1,32 @@
+resources:
+  jobs:
+    retail_lakehouse_job:
+      name: ${bundle.target}-retail-lakehouse-job
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: generate_source_data
+          notebook_task:
+            notebook_path: ../src/setup/generate_source_data.py
+            base_parameters:
+              catalog: ${var.catalog}
+              source_schema: ${var.source_schema}
+              volume: ${var.volume}
+
+        - task_key: refresh_pipeline
+          depends_on:
+            - task_key: generate_source_data
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.retail_lakehouse_pipeline.id}
+            full_refresh: false
+
+        - task_key: validate_outputs
+          depends_on:
+            - task_key: refresh_pipeline
+          notebook_task:
+            notebook_path: ../src/validation/validate_pipeline.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+      queue:
+        enabled: true

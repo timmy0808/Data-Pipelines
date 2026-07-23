@@ -1,0 +1,50 @@
+bundle:
+  name: databricks_retail_lakehouse
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog used by the project.
+    default: retail_dev
+  schema:
+    description: Schema containing pipeline output tables.
+    default: retail_lakehouse
+  source_schema:
+    description: Schema containing the source volume.
+    default: retail_sources
+  volume:
+    description: Unity Catalog volume containing generated source files.
+    default: landing
+  warehouse_id:
+    description: Optional SQL warehouse ID for future SQL tasks.
+    default: ""
+
+workspace:
+  root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+
+targets:
+  dev:
+    default: true
+    mode: development
+    variables:
+      catalog: retail_dev
+      schema: retail_lakehouse
+      source_schema: retail_sources
+      volume: landing
+
+  prod:
+    mode: production
+    resources:
+      pipelines:
+        retail_lakehouse_pipeline:
+          development: false
+    variables:
+      catalog: retail_prod
+      schema: retail_lakehouse
+      source_schema: retail_sources
+      volume: landing
+    permissions:
+      - level: CAN_VIEW
+        group_name: users
