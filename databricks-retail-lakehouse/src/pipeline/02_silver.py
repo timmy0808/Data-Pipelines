@@ -1,125 +1,164 @@
+"""
+Silver-layer transformations for retail orders.
+
+Creates:
+    silver_orders
+        Validated, standardized, and deduplicated order records.
+
+    quarantine_orders
+        Invalid order records retained for investigation.
+
+Source:
+    bronze_orders
+"""
+
 from pyspark import pipelines as dp
+from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 
-VALID_ORDER_STATUSES = ["PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"]
+VALID_ORDER_STATUSES = [
+    "PROCESSING",
+    "SHIPPED",
+    "DELIVERED",
+    "CANCELLED",
+]
+
+VALID_ORDER_CONDITION = """
+    order_id IS NOT NULL
+    AND customer_id IS NOT NULL
+    AND order_timestamp IS NOT NULL
+    AND status IN (
+        'PROCESSING',
+        'SHIPPED',
+        'DELIVERED',
+        'CANCELLED'
+    )
+    AND order_total IS NOT NULL
+    AND order_total >= 0
+"""
 
 
-@dp.temporary_view(name="customers_classified")
-def customers_classified():
+def standardize_orders(df: DataFrame) -> DataFrame:
+    """
+    Standardize Bronze order records before validation.
+
+    Transformations:
+        - Trim identifier fields
+        - Normalize status and payment method to uppercase
+        - Round monetary values to two decimal places
+        - Derive order_date
+        - Add a validation failure reason
+    """
+
+    normalized_status = F.upper(F.trim(F.col("status")))
+
     return (
-        spark.readStream.table("bronze_customers")
+        df.select(
+            F.trim(F.col("order_id")).alias("order_id"),
+            F.trim(F.col("customer_id")).alias("customer_id"),
+            F.col("order_timestamp").cast("timestamp").alias(
+                "order_timestamp"
+            ),
+            normalized_status.alias("status"),
+            F.upper(F.trim(F.col("payment_method"))).alias(
+                "payment_method"
+            ),
+            F.round(
+                F.col("order_total").cast("decimal(18, 2)"),
+                2,
+            ).alias("order_total"),
+            F.col("_rescued_data"),
+            F.col("_source_file"),
+            F.col("_ingested_at"),
+        )
         .withColumn(
-            "_is_valid",
-            F.col("customer_id").isNotNull()
-            & F.col("email").contains("@")
-            & F.col("updated_at").isNotNull()
+            "order_date",
+            F.to_date(F.col("order_timestamp")),
         )
-    )
-
-
-@dp.table(
-    name="silver_customers",
-    comment="Validated, standardized, and deduplicated customer records.",
-    table_properties={"quality": "silver"},
-)
-@dp.expect_or_drop("valid_customer", "_is_valid = true")
-def silver_customers():
-    return (
-        spark.readStream.table("customers_classified")
-        .withWatermark("updated_at", "30 days")
-        .dropDuplicates(["customer_id", "updated_at"])
-        .select(
-            "customer_id",
-            F.initcap("first_name").alias("first_name"),
-            F.initcap("last_name").alias("last_name"),
-            F.lower("email").alias("email"),
-            F.initcap("city").alias("city"),
-            F.upper("state").alias("state"),
-            F.initcap("region").alias("region"),
-            "created_at",
-            "updated_at",
-            "_source_file",
-            "_ingested_at",
-        )
-    )
-
-
-@dp.table(
-    name="quarantine_customers",
-    comment="Customer rows that failed Silver-layer validation.",
-    table_properties={"quality": "quarantine"},
-)
-def quarantine_customers():
-    return (
-        spark.readStream.table("customers_classified")
-        .filter("NOT _is_valid")
         .withColumn(
-            "_quarantine_reason",
-            F.lit("Missing customer_id, invalid email, or missing updated_at")
+            "_validation_error",
+            F.when(
+                F.col("order_id").isNull()
+                | (F.length(F.col("order_id")) == 0),
+                F.lit("missing_order_id"),
+            )
+            .when(
+                F.col("customer_id").isNull()
+                | (F.length(F.col("customer_id")) == 0),
+                F.lit("missing_customer_id"),
+            )
+            .when(
+                F.col("order_timestamp").isNull(),
+                F.lit("missing_or_invalid_order_timestamp"),
+            )
+            .when(
+                ~F.col("status").isin(VALID_ORDER_STATUSES),
+                F.lit("invalid_order_status"),
+            )
+            .when(
+                F.col("order_total").isNull(),
+                F.lit("missing_or_invalid_order_total"),
+            )
+            .when(
+                F.col("order_total") < 0,
+                F.lit("negative_order_total"),
+            )
+            .otherwise(F.lit(None)),
         )
     )
 
 
-@dp.table(
-    name="silver_products",
-    comment="Validated and standardized product master.",
-    table_properties={"quality": "silver"},
+@dp.temporary_view(
+    name="orders_standardized",
+    comment="Standardized Bronze order records before validation.",
 )
-@dp.expect_or_drop("valid_product_id", "product_id IS NOT NULL")
-@dp.expect_or_drop("positive_product_price", "unit_price > 0")
-def silver_products():
-    return (
-        spark.readStream.table("bronze_products")
-        .withWatermark("updated_at", "30 days")
-        .dropDuplicates(["product_id", "updated_at"])
-        .select(
-            "product_id",
-            F.trim("product_name").alias("product_name"),
-            F.initcap("category").alias("category"),
-            F.round("unit_price", 2).alias("unit_price"),
-            "active",
-            "updated_at",
-            "_source_file",
-            "_ingested_at",
-        )
-    )
+def orders_standardized() -> DataFrame:
+    """
+    Read and standardize incoming Bronze order records.
+    """
 
-
-@dp.temporary_view(name="orders_classified")
-def orders_classified():
-    return (
+    return standardize_orders(
         spark.readStream.table("bronze_orders")
-        .withColumn(
-            "_is_valid",
-            F.col("order_id").isNotNull()
-            & F.col("customer_id").isNotNull()
-            & F.col("order_timestamp").isNotNull()
-            & F.upper("status").isin(VALID_ORDER_STATUSES)
-            & (F.col("order_total") >= 0)
-        )
     )
 
 
 @dp.table(
     name="silver_orders",
-    comment="Validated and deduplicated order headers.",
-    table_properties={"quality": "silver"},
+    comment=(
+        "Validated, standardized, and deduplicated retail orders."
+    ),
+    table_properties={
+        "quality": "silver",
+        "layer": "silver",
+        "pipelines.autoOptimize.managed": "true",
+    },
 )
-@dp.expect_or_drop("valid_order", "_is_valid = true")
-def silver_orders():
+@dp.expect_or_drop(
+    "valid_order",
+    VALID_ORDER_CONDITION,
+)
+def silver_orders() -> DataFrame:
+    """
+    Produce the clean Silver orders streaming table.
+
+    The expectation references only columns present in the returned
+    DataFrame, avoiding the unresolved `_is_valid` column error.
+    """
+
     return (
-        spark.readStream.table("orders_classified")
+        spark.readStream.table("orders_standardized")
+        .filter(F.col("_validation_error").isNull())
         .withWatermark("order_timestamp", "60 days")
         .dropDuplicates(["order_id"])
         .select(
             "order_id",
             "customer_id",
             "order_timestamp",
-            F.to_date("order_timestamp").alias("order_date"),
-            F.upper("status").alias("status"),
-            F.upper("payment_method").alias("payment_method"),
-            F.round("order_total", 2).alias("order_total"),
+            "order_date",
+            "status",
+            "payment_method",
+            "order_total",
             "_source_file",
             "_ingested_at",
         )
@@ -128,42 +167,39 @@ def silver_orders():
 
 @dp.table(
     name="quarantine_orders",
-    comment="Order rows that failed Silver-layer validation.",
-    table_properties={"quality": "quarantine"},
+    comment=(
+        "Order records rejected from the Silver layer because they "
+        "failed data-quality validation."
+    ),
+    table_properties={
+        "quality": "quarantine",
+        "layer": "silver",
+    },
 )
-def quarantine_orders():
+def quarantine_orders() -> DataFrame:
+    """
+    Preserve invalid records for investigation and reprocessing.
+    """
+
     return (
-        spark.readStream.table("orders_classified")
-        .filter("NOT _is_valid")
+        spark.readStream.table("orders_standardized")
+        .filter(F.col("_validation_error").isNotNull())
         .withColumn(
-            "_quarantine_reason",
-            F.lit("Missing key, invalid status, timestamp, or negative order total")
+            "_quarantined_at",
+            F.current_timestamp(),
         )
-    )
-
-
-@dp.table(
-    name="silver_order_items",
-    comment="Validated and deduplicated order line items.",
-    table_properties={"quality": "silver"},
-)
-@dp.expect_or_drop("valid_order_item_id", "order_item_id IS NOT NULL")
-@dp.expect_or_drop("valid_order_reference", "order_id IS NOT NULL")
-@dp.expect_or_drop("valid_product_reference", "product_id IS NOT NULL")
-@dp.expect_or_drop("positive_quantity", "quantity > 0")
-@dp.expect_or_drop("valid_line_total", "line_total >= 0")
-def silver_order_items():
-    return (
-        spark.readStream.table("bronze_order_items")
-        .dropDuplicates(["order_item_id"])
         .select(
-            "order_item_id",
             "order_id",
-            "product_id",
-            "quantity",
-            F.round("unit_price", 2).alias("unit_price"),
-            F.round("line_total", 2).alias("line_total"),
+            "customer_id",
+            "order_timestamp",
+            "order_date",
+            "status",
+            "payment_method",
+            "order_total",
+            "_validation_error",
+            "_rescued_data",
             "_source_file",
             "_ingested_at",
+            "_quarantined_at",
         )
     )
