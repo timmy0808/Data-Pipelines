@@ -1,15 +1,15 @@
 """
-Silver-layer customer transformations.
+Silver-layer product transformations.
 
 Creates:
-    silver_customers
-        Validated, standardized, and deduplicated customer records.
+    silver_products
+        Validated, standardized, and deduplicated products.
 
-    quarantine_customers
-        Invalid customer records retained for investigation.
+    quarantine_products
+        Invalid products retained for investigation.
 
 Source:
-    bronze_customers
+    bronze_products
 """
 
 from pyspark import pipelines as dp
@@ -17,29 +17,60 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 
-VALID_CUSTOMER_CONDITION = """
-    customer_id IS NOT NULL
-    AND trim(customer_id) <> ''
-    AND email IS NOT NULL
-    AND email LIKE '%@%'
-    AND updated_at IS NOT NULL
+VALID_PRODUCT_CONDITION = """
+    product_id IS NOT NULL
+    AND trim(product_id) <> ''
+    AND product_name IS NOT NULL
+    AND trim(product_name) <> ''
+    AND unit_price IS NOT NULL
+    AND unit_price >= 0
 """
 
 
-def standardize_customers(df: DataFrame) -> DataFrame:
+def standardize_products(df: DataFrame) -> DataFrame:
     """
-    Standardize Bronze customer records and assign validation errors.
+    Standardize product records and assign validation errors.
     """
+
+    normalized_active = (
+        F.when(
+            F.lower(F.trim(F.col("active").cast("string"))).isin(
+                "true",
+                "1",
+                "yes",
+                "y",
+                "active",
+            ),
+            F.lit(True),
+        )
+        .when(
+            F.lower(F.trim(F.col("active").cast("string"))).isin(
+                "false",
+                "0",
+                "no",
+                "n",
+                "inactive",
+            ),
+            F.lit(False),
+        )
+        .otherwise(F.lit(None).cast("boolean"))
+    )
 
     return (
         df.select(
-            F.trim(F.col("customer_id")).alias("customer_id"),
-            F.initcap(F.trim(F.col("first_name"))).alias("first_name"),
-            F.initcap(F.trim(F.col("last_name"))).alias("last_name"),
-            F.lower(F.trim(F.col("email"))).alias("email"),
-            F.initcap(F.trim(F.col("city"))).alias("city"),
-            F.upper(F.trim(F.col("state"))).alias("state"),
-            F.initcap(F.trim(F.col("region"))).alias("region"),
+            F.trim(F.col("product_id")).alias("product_id"),
+            F.initcap(F.trim(F.col("product_name"))).alias(
+                "product_name"
+            ),
+            F.initcap(F.trim(F.col("category"))).alias("category"),
+            F.initcap(F.trim(F.col("subcategory"))).alias(
+                "subcategory"
+            ),
+            F.round(
+                F.col("unit_price").cast("decimal(18, 2)"),
+                2,
+            ).alias("unit_price"),
+            normalized_active.alias("active"),
             F.col("created_at").cast("timestamp").alias("created_at"),
             F.col("updated_at").cast("timestamp").alias("updated_at"),
             F.col("_rescued_data"),
@@ -49,22 +80,26 @@ def standardize_customers(df: DataFrame) -> DataFrame:
         .withColumn(
             "_validation_error",
             F.when(
-                F.col("customer_id").isNull()
-                | (F.length(F.col("customer_id")) == 0),
-                F.lit("missing_customer_id"),
+                F.col("product_id").isNull()
+                | (F.length(F.col("product_id")) == 0),
+                F.lit("missing_product_id"),
             )
             .when(
-                F.col("email").isNull()
-                | (F.length(F.col("email")) == 0),
-                F.lit("missing_email"),
+                F.col("product_name").isNull()
+                | (F.length(F.col("product_name")) == 0),
+                F.lit("missing_product_name"),
             )
             .when(
-                ~F.col("email").contains("@"),
-                F.lit("invalid_email"),
+                F.col("unit_price").isNull(),
+                F.lit("missing_or_invalid_unit_price"),
             )
             .when(
-                F.col("updated_at").isNull(),
-                F.lit("missing_or_invalid_updated_at"),
+                F.col("unit_price") < 0,
+                F.lit("negative_unit_price"),
+            )
+            .when(
+                F.col("active").isNull(),
+                F.lit("invalid_active_value"),
             )
             .otherwise(F.lit(None)),
         )
@@ -72,24 +107,18 @@ def standardize_customers(df: DataFrame) -> DataFrame:
 
 
 @dp.temporary_view(
-    name="customers_standardized",
-    comment="Standardized customer records before validation.",
+    name="products_standardized",
+    comment="Standardized product records before validation.",
 )
-def customers_standardized() -> DataFrame:
-    """
-    Read Bronze customer data and apply standardization rules.
-    """
-
-    return standardize_customers(
-        spark.readStream.table("bronze_customers")
+def products_standardized() -> DataFrame:
+    return standardize_products(
+        spark.readStream.table("bronze_products")
     )
 
 
 @dp.table(
-    name="silver_customers",
-    comment=(
-        "Validated, standardized, and deduplicated retail customers."
-    ),
+    name="silver_products",
+    comment="Validated and standardized retail products.",
     table_properties={
         "quality": "silver",
         "layer": "silver",
@@ -97,30 +126,21 @@ def customers_standardized() -> DataFrame:
     },
 )
 @dp.expect_or_drop(
-    "valid_customer",
-    VALID_CUSTOMER_CONDITION,
+    "valid_product",
+    VALID_PRODUCT_CONDITION,
 )
-def silver_customers() -> DataFrame:
-    """
-    Produce the clean Silver customer table.
-
-    The expectation references columns returned by this function rather
-    than a temporary `_is_valid` column.
-    """
-
+def silver_products() -> DataFrame:
     return (
-        spark.readStream.table("customers_standardized")
+        spark.readStream.table("products_standardized")
         .filter(F.col("_validation_error").isNull())
-        .withWatermark("updated_at", "30 days")
-        .dropDuplicates(["customer_id"])
+        .dropDuplicates(["product_id"])
         .select(
-            "customer_id",
-            "first_name",
-            "last_name",
-            "email",
-            "city",
-            "state",
-            "region",
+            "product_id",
+            "product_name",
+            "category",
+            "subcategory",
+            "unit_price",
+            "active",
             "created_at",
             "updated_at",
             "_source_file",
@@ -130,36 +150,25 @@ def silver_customers() -> DataFrame:
 
 
 @dp.table(
-    name="quarantine_customers",
-    comment=(
-        "Customer records rejected from the Silver layer because they "
-        "failed validation."
-    ),
+    name="quarantine_products",
+    comment="Product records rejected during Silver validation.",
     table_properties={
         "quality": "quarantine",
         "layer": "silver",
     },
 )
-def quarantine_customers() -> DataFrame:
-    """
-    Preserve invalid customer records for review and reprocessing.
-    """
-
+def quarantine_products() -> DataFrame:
     return (
-        spark.readStream.table("customers_standardized")
+        spark.readStream.table("products_standardized")
         .filter(F.col("_validation_error").isNotNull())
-        .withColumn(
-            "_quarantined_at",
-            F.current_timestamp(),
-        )
+        .withColumn("_quarantined_at", F.current_timestamp())
         .select(
-            "customer_id",
-            "first_name",
-            "last_name",
-            "email",
-            "city",
-            "state",
-            "region",
+            "product_id",
+            "product_name",
+            "category",
+            "subcategory",
+            "unit_price",
+            "active",
             "created_at",
             "updated_at",
             "_validation_error",
