@@ -1,15 +1,15 @@
 """
-Silver-layer transformations for retail orders.
+Silver-layer customer transformations.
 
 Creates:
-    silver_orders
-        Validated, standardized, and deduplicated order records.
+    silver_customers
+        Validated, standardized, and deduplicated customer records.
 
-    quarantine_orders
-        Invalid order records retained for investigation.
+    quarantine_customers
+        Invalid customer records retained for investigation.
 
 Source:
-    bronze_orders
+    bronze_customers
 """
 
 from pyspark import pipelines as dp
@@ -17,92 +17,54 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 
-VALID_ORDER_STATUSES = [
-    "PROCESSING",
-    "SHIPPED",
-    "DELIVERED",
-    "CANCELLED",
-]
-
-VALID_ORDER_CONDITION = """
-    order_id IS NOT NULL
-    AND customer_id IS NOT NULL
-    AND order_timestamp IS NOT NULL
-    AND status IN (
-        'PROCESSING',
-        'SHIPPED',
-        'DELIVERED',
-        'CANCELLED'
-    )
-    AND order_total IS NOT NULL
-    AND order_total >= 0
+VALID_CUSTOMER_CONDITION = """
+    customer_id IS NOT NULL
+    AND trim(customer_id) <> ''
+    AND email IS NOT NULL
+    AND email LIKE '%@%'
+    AND updated_at IS NOT NULL
 """
 
 
-def standardize_orders(df: DataFrame) -> DataFrame:
+def standardize_customers(df: DataFrame) -> DataFrame:
     """
-    Standardize Bronze order records before validation.
-
-    Transformations:
-        - Trim identifier fields
-        - Normalize status and payment method to uppercase
-        - Round monetary values to two decimal places
-        - Derive order_date
-        - Add a validation failure reason
+    Standardize Bronze customer records and assign validation errors.
     """
-
-    normalized_status = F.upper(F.trim(F.col("status")))
 
     return (
         df.select(
-            F.trim(F.col("order_id")).alias("order_id"),
             F.trim(F.col("customer_id")).alias("customer_id"),
-            F.col("order_timestamp").cast("timestamp").alias(
-                "order_timestamp"
-            ),
-            normalized_status.alias("status"),
-            F.upper(F.trim(F.col("payment_method"))).alias(
-                "payment_method"
-            ),
-            F.round(
-                F.col("order_total").cast("decimal(18, 2)"),
-                2,
-            ).alias("order_total"),
+            F.initcap(F.trim(F.col("first_name"))).alias("first_name"),
+            F.initcap(F.trim(F.col("last_name"))).alias("last_name"),
+            F.lower(F.trim(F.col("email"))).alias("email"),
+            F.initcap(F.trim(F.col("city"))).alias("city"),
+            F.upper(F.trim(F.col("state"))).alias("state"),
+            F.initcap(F.trim(F.col("region"))).alias("region"),
+            F.col("created_at").cast("timestamp").alias("created_at"),
+            F.col("updated_at").cast("timestamp").alias("updated_at"),
             F.col("_rescued_data"),
             F.col("_source_file"),
             F.col("_ingested_at"),
         )
         .withColumn(
-            "order_date",
-            F.to_date(F.col("order_timestamp")),
-        )
-        .withColumn(
             "_validation_error",
             F.when(
-                F.col("order_id").isNull()
-                | (F.length(F.col("order_id")) == 0),
-                F.lit("missing_order_id"),
-            )
-            .when(
                 F.col("customer_id").isNull()
                 | (F.length(F.col("customer_id")) == 0),
                 F.lit("missing_customer_id"),
             )
             .when(
-                F.col("order_timestamp").isNull(),
-                F.lit("missing_or_invalid_order_timestamp"),
+                F.col("email").isNull()
+                | (F.length(F.col("email")) == 0),
+                F.lit("missing_email"),
             )
             .when(
-                ~F.col("status").isin(VALID_ORDER_STATUSES),
-                F.lit("invalid_order_status"),
+                ~F.col("email").contains("@"),
+                F.lit("invalid_email"),
             )
             .when(
-                F.col("order_total").isNull(),
-                F.lit("missing_or_invalid_order_total"),
-            )
-            .when(
-                F.col("order_total") < 0,
-                F.lit("negative_order_total"),
+                F.col("updated_at").isNull(),
+                F.lit("missing_or_invalid_updated_at"),
             )
             .otherwise(F.lit(None)),
         )
@@ -110,23 +72,23 @@ def standardize_orders(df: DataFrame) -> DataFrame:
 
 
 @dp.temporary_view(
-    name="orders_standardized",
-    comment="Standardized Bronze order records before validation.",
+    name="customers_standardized",
+    comment="Standardized customer records before validation.",
 )
-def orders_standardized() -> DataFrame:
+def customers_standardized() -> DataFrame:
     """
-    Read and standardize incoming Bronze order records.
+    Read Bronze customer data and apply standardization rules.
     """
 
-    return standardize_orders(
-        spark.readStream.table("bronze_orders")
+    return standardize_customers(
+        spark.readStream.table("bronze_customers")
     )
 
 
 @dp.table(
-    name="silver_orders",
+    name="silver_customers",
     comment=(
-        "Validated, standardized, and deduplicated retail orders."
+        "Validated, standardized, and deduplicated retail customers."
     ),
     table_properties={
         "quality": "silver",
@@ -135,30 +97,32 @@ def orders_standardized() -> DataFrame:
     },
 )
 @dp.expect_or_drop(
-    "valid_order",
-    VALID_ORDER_CONDITION,
+    "valid_customer",
+    VALID_CUSTOMER_CONDITION,
 )
-def silver_orders() -> DataFrame:
+def silver_customers() -> DataFrame:
     """
-    Produce the clean Silver orders streaming table.
+    Produce the clean Silver customer table.
 
-    The expectation references only columns present in the returned
-    DataFrame, avoiding the unresolved `_is_valid` column error.
+    The expectation references columns returned by this function rather
+    than a temporary `_is_valid` column.
     """
 
     return (
-        spark.readStream.table("orders_standardized")
+        spark.readStream.table("customers_standardized")
         .filter(F.col("_validation_error").isNull())
-        .withWatermark("order_timestamp", "60 days")
-        .dropDuplicates(["order_id"])
+        .withWatermark("updated_at", "30 days")
+        .dropDuplicates(["customer_id"])
         .select(
-            "order_id",
             "customer_id",
-            "order_timestamp",
-            "order_date",
-            "status",
-            "payment_method",
-            "order_total",
+            "first_name",
+            "last_name",
+            "email",
+            "city",
+            "state",
+            "region",
+            "created_at",
+            "updated_at",
             "_source_file",
             "_ingested_at",
         )
@@ -166,36 +130,38 @@ def silver_orders() -> DataFrame:
 
 
 @dp.table(
-    name="quarantine_orders",
+    name="quarantine_customers",
     comment=(
-        "Order records rejected from the Silver layer because they "
-        "failed data-quality validation."
+        "Customer records rejected from the Silver layer because they "
+        "failed validation."
     ),
     table_properties={
         "quality": "quarantine",
         "layer": "silver",
     },
 )
-def quarantine_orders() -> DataFrame:
+def quarantine_customers() -> DataFrame:
     """
-    Preserve invalid records for investigation and reprocessing.
+    Preserve invalid customer records for review and reprocessing.
     """
 
     return (
-        spark.readStream.table("orders_standardized")
+        spark.readStream.table("customers_standardized")
         .filter(F.col("_validation_error").isNotNull())
         .withColumn(
             "_quarantined_at",
             F.current_timestamp(),
         )
         .select(
-            "order_id",
             "customer_id",
-            "order_timestamp",
-            "order_date",
-            "status",
-            "payment_method",
-            "order_total",
+            "first_name",
+            "last_name",
+            "email",
+            "city",
+            "state",
+            "region",
+            "created_at",
+            "updated_at",
             "_validation_error",
             "_rescued_data",
             "_source_file",
